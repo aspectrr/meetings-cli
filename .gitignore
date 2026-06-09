@@ -1,0 +1,7 @@
+.pi
+
+
+# Added by cargo
+
+/target
+.fastembed_cache
