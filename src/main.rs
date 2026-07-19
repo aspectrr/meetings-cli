@@ -8,9 +8,9 @@ use meetings::*;
     about = "CLI for querying hyprnote meeting sessions"
 )]
 struct Cli {
-    /// Path to hyprnote sessions directory
+    /// Path to the Anarlog/hyprnote app.db database
     #[arg(long, global = true)]
-    sessions_path: Option<String>,
+    db_path: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -61,22 +61,14 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let db_path = match cli.db_path.as_deref() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => models::default_db_path()?,
+    };
 
     match cli.command {
         Commands::List { json } => {
-            let sp = cli.sessions_path.as_deref().map(std::path::Path::new);
-            let sp = match sp {
-                Some(p) => p.to_path_buf(),
-                None => models::default_sessions_path()?,
-            };
-            let dirs = models::session_dirs(&sp)?;
-            let mut entries = Vec::new();
-            for d in &dirs {
-                match models::Session::load(d) {
-                    Ok(s) => entries.push(s),
-                    Err(e) => eprintln!("Error loading {}: {e}", d.display()),
-                }
-            }
+            let entries = models::load_sessions(&db_path)?;
 
             if json {
                 let out: Vec<serde_json::Value> = entries
@@ -105,28 +97,17 @@ fn main() -> Result<()> {
             }
         }
         Commands::Index { segment_ms } => {
-            let sp = cli.sessions_path.as_deref().map(std::path::Path::new);
-            index::run_index(sp, segment_ms)?;
+            index::run_index(&db_path, segment_ms)?;
         }
         Commands::Search { query, top_k, json } => {
             search::run_search(&query, top_k, json)?;
         }
         Commands::Show { id } => {
-            let sp = cli.sessions_path.as_deref().map(std::path::Path::new);
-            let sp = match sp {
-                Some(p) => p.to_path_buf(),
-                None => models::default_sessions_path()?,
-            };
-            let dirs = models::session_dirs(&sp)?;
-            let session = dirs
+            let entries = models::load_sessions(&db_path)?;
+            let session = entries
                 .iter()
-                .find_map(|d| {
-                    let s = models::Session::load(d).ok()?;
-                    if s.id == id || s.meta.title.to_lowercase().contains(&id.to_lowercase()) {
-                        Some(s)
-                    } else {
-                        None
-                    }
+                .find(|s| {
+                    s.id == id || s.meta.title.to_lowercase().contains(&id.to_lowercase())
                 })
                 .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
 
@@ -137,21 +118,11 @@ fn main() -> Result<()> {
             println!("{}", session.memo);
         }
         Commands::Speakers { id, pause_ms, json } => {
-            let sp = cli.sessions_path.as_deref().map(std::path::Path::new);
-            let sp = match sp {
-                Some(p) => p.to_path_buf(),
-                None => models::default_sessions_path()?,
-            };
-            let dirs = models::session_dirs(&sp)?;
-            let session = dirs
+            let entries = models::load_sessions(&db_path)?;
+            let session = entries
                 .iter()
-                .find_map(|d| {
-                    let s = models::Session::load(d).ok()?;
-                    if s.id == id || s.meta.title.to_lowercase().contains(&id.to_lowercase()) {
-                        Some(s)
-                    } else {
-                        None
-                    }
+                .find(|s| {
+                    s.id == id || s.meta.title.to_lowercase().contains(&id.to_lowercase())
                 })
                 .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
 

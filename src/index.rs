@@ -1,25 +1,13 @@
-use crate::models::{default_sessions_path, session_dirs, Chunk, Session};
+use crate::models::{load_sessions, Chunk};
 use crate::store::Store;
 use anyhow::Result;
 
 /// Index all sessions: chunk text, embed, save to store
-pub fn run_index(sessions_path: Option<&std::path::Path>, segment_ms: i64) -> Result<()> {
-    let sp = match sessions_path {
-        Some(p) => p.to_path_buf(),
-        None => default_sessions_path()?,
-    };
-
-    println!("Loading sessions from {}...", sp.display());
-    let dirs = session_dirs(&sp)?;
-    let mut sessions = Vec::new();
-    for d in &dirs {
-        match Session::load(d) {
-            Ok(s) => {
-                println!("  Loaded: {} ({})", s.meta.title, s.id);
-                sessions.push(s);
-            }
-            Err(e) => eprintln!("  Skipping {}: {e}", d.display()),
-        }
+pub fn run_index(db_path: &std::path::Path, segment_ms: i64) -> Result<()> {
+    println!("Loading sessions from {}...", db_path.display());
+    let sessions = load_sessions(db_path)?;
+    for s in &sessions {
+        println!("  Loaded: {} ({})", s.meta.title, s.id);
     }
 
     println!("Building chunks (segment duration: {segment_ms}ms)...");

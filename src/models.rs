@@ -1,7 +1,9 @@
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Session metadata from _meta.json
+/// Session metadata (loaded from app.db)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub created_at: String,
@@ -14,11 +16,11 @@ pub struct Meta {
 pub struct Participant {
     pub id: String,
     pub session_id: String,
-    pub source: String,
-    #[serde(default)]
     pub human_id: String,
-    #[serde(default)]
-    pub user_id: String,
+    pub display_name: String,
+    pub email: String,
+    pub role: String,
+    pub source: String,
 }
 
 /// Transcript from transcript.json
@@ -36,6 +38,9 @@ pub struct Transcript {
     pub speaker_hints: Vec<serde_json::Value>,
     #[serde(default)]
     pub started_at: i64,
+    /// Memo text extracted from ProseMirror JSON (per transcript row).
+    #[serde(default, skip)]
+    pub memo: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,29 +92,6 @@ pub struct Utterance {
 }
 
 impl Session {
-    pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
-        let meta_path = dir.join("_meta.json");
-        let memo_path = dir.join("_memo.md");
-        let transcript_path = dir.join("transcript.json");
-
-        let meta: Meta = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-        let memo = std::fs::read_to_string(&memo_path)?;
-        let transcript = if transcript_path.exists() {
-            Some(serde_json::from_str(&std::fs::read_to_string(
-                &transcript_path,
-            )?)?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            id: meta.id.clone(),
-            path: dir.to_path_buf(),
-            meta,
-            memo,
-            transcript,
-        })
-    }
 
     /// Extract utterances from transcript (group words by channel with pause detection)
     pub fn utterances(&self, pause_threshold_ms: i64) -> Vec<Utterance> {
@@ -239,21 +221,208 @@ impl Session {
     }
 }
 
-/// List all session directories
-pub fn session_dirs(sessions_path: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let mut dirs = vec![];
-    for entry in std::fs::read_dir(sessions_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && path.join("_meta.json").exists() {
-            dirs.push(path);
-        }
-    }
-    dirs.sort();
-    Ok(dirs)
+/// Default location of the Anarlog (formerly hyprnote) SQLite database.
+pub fn default_db_path() -> anyhow::Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+    Ok(home.join("Library/Application Support/hyprnote/app.db"))
 }
 
-pub fn default_sessions_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
-    Ok(home.join("Library/Application Support/hyprnote/sessions"))
+/// Load every (non-deleted) session from the Anarlog SQLite database.
+///
+/// Replaces the old flat-file reader (`_meta.json` / `_memo.md` / `transcript.json`):
+/// newer Anarlog versions write everything to `app.db` and stop emitting those
+/// files, so a session folder can contain only `audio.mp3` (e.g. the CDL Intro
+/// Meeting) yet be fully present in the DB.
+pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> {
+    // immutable=1: treat the live app DB as read-only snapshot so we never need
+    // write access to the -wal/-shm files the app may hold open.
+    let abs = db_path
+        .canonicalize()
+        .unwrap_or_else(|_| db_path.to_path_buf());
+    let uri = format!("file:{}?immutable=1", abs.display());
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+
+    // All transcripts, grouped by session_id.
+    let mut transcripts_by_session: HashMap<String, Vec<Transcript>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT session_id, id, started_at_ms, words_json, speaker_hints_json, memo
+         FROM transcripts
+         WHERE deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        let id: String = row.get(1)?;
+        let started_at: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+        let words_json: String = row.get(3)?;
+        let speaker_json: String = row.get(4)?;
+        let memo_json: String = row.get(5)?;
+
+        let words: Vec<Word> = serde_json::from_str(&words_json).unwrap_or_default();
+        let speaker_hints: Vec<serde_json::Value> =
+            serde_json::from_str(&speaker_json).unwrap_or_default();
+        // Remember which transcript row carried the memo, keyed by transcript id.
+        let memo_text = prosemirror_to_text(&memo_json);
+
+        // ponytail: stash memo text on the first word's id-free path via a side map.
+        transcripts_by_session.entry(session_id).or_default().push(Transcript {
+            id,
+            session_id: String::new(),
+            words,
+            speaker_hints,
+            started_at,
+            memo: memo_text,
+        });
+    }
+    drop(rows);
+    drop(stmt);
+
+    // All participants, grouped by session_id.
+    let mut parts_by_session: HashMap<String, Vec<Participant>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, human_id, display_name, email, role, source
+         FROM session_participants
+         WHERE deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(1)?;
+        parts_by_session.entry(session_id.clone()).or_default().push(Participant {
+            id: row.get(0)?,
+            session_id,
+            human_id: row.get(2)?,
+            display_name: row.get(3)?,
+            email: row.get(4)?,
+            role: row.get(5)?,
+            source: row.get(6)?,
+        });
+    }
+
+    // Sessions, newest first.
+    let mut stmt = conn.prepare(
+        "SELECT id, title, created_at FROM sessions WHERE deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let created_at: String = row.get(2)?;
+
+        let mut session_transcripts = transcripts_by_session.remove(&id).unwrap_or_default();
+        session_transcripts.sort_by_key(|t| t.started_at);
+        let participants = parts_by_session.remove(&id).unwrap_or_default();
+        // Merge any memo text across transcript rows into the session memo.
+        let memo = session_transcripts
+            .iter()
+            .map(|t| t.memo.as_str())
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let transcript = if session_transcripts.is_empty() {
+            None
+        } else {
+            Some(TranscriptFile {
+                transcripts: session_transcripts,
+            })
+        };
+
+        sessions.push(Session {
+            id: id.clone(),
+            path: PathBuf::new(),
+            meta: Meta {
+                created_at,
+                id,
+                title,
+                participants,
+            },
+            memo,
+            transcript,
+        });
+    }
+
+    sessions.sort_by(|a, b| b.meta.created_at.cmp(&a.meta.created_at));
+    Ok(sessions)
+}
+
+/// Convert a ProseMirror JSON document to plain text.
+/// ponytail: text-only walk; fine for embedding/search + display. Not a full
+/// markdown renderer — tables/marks are flattened. Upgrade path: a real PM
+/// renderer if structured markdown output is ever needed.
+fn prosemirror_to_text(json: &str) -> String {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        // Not JSON (e.g. legacy plain-text memo) — use as-is.
+        Err(_) => return json.trim().to_string(),
+    };
+    let mut out = String::new();
+    pm_walk(&value, &mut out);
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out.trim().to_string()
+}
+
+const PM_BLOCK_TYPES: &[&str] = &[
+    "paragraph",
+    "heading",
+    "bulletList",
+    "orderedList",
+    "listItem",
+    "codeBlock",
+    "blockquote",
+];
+
+fn pm_walk(node: &serde_json::Value, out: &mut String) {
+    let ty = node.get("type").and_then(|t| t.as_str());
+    match ty {
+        Some("text") => {
+            if let Some(t) = node.get("text").and_then(|v| v.as_str()) {
+                out.push_str(t);
+            }
+        }
+        Some("hardBreak") => out.push('\n'),
+        _ => {
+            if let Some(content) = node.get("content").and_then(|c| c.as_array()) {
+                for child in content {
+                    pm_walk(child, out);
+                }
+            }
+        }
+    }
+    if let Some(t) = ty {
+        if PM_BLOCK_TYPES.contains(&t) {
+            out.push('\n');
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prosemirror_to_text;
+
+    #[test]
+    fn prosemirror_extracts_text_with_newlines() {
+        let doc = r#"{"type":"doc","content":[{"type":"heading","attrs":{"level":1},"content":[{"type":"text","text":"CDL Intro Meeting"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"rebuild website"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"automation playbook"}]}]}]}]}"#;
+        let text = prosemirror_to_text(doc);
+        assert!(text.contains("CDL Intro Meeting"));
+        assert!(text.contains("rebuild website"));
+        assert!(text.contains("automation playbook"));
+        // block nodes produce newlines, so the two list items are separated
+        assert!(text.contains("rebuild website\n") || text.contains("website\n\n") || text.contains("website\n"));
+    }
+
+    #[test]
+    fn prosemirror_falls_back_on_plain_text() {
+        // Non-JSON memo (legacy plain text) is returned as-is.
+        assert_eq!(prosemirror_to_text("just plain notes"), "just plain notes");
+    }
+
+    #[test]
+    fn prosemirror_empty_doc() {
+        assert_eq!(prosemirror_to_text("{\"type\":\"doc\",\"content\":[]}"), "");
+    }
 }

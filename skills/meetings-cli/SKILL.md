@@ -10,6 +10,7 @@ A CLI tool for querying hyprnote meeting sessions stored locally. Provides seman
 ## Prerequisites
 
 - `meetings` CLI must be installed (`cargo install --path /Users/collinpfeifer/GitHub/meetings-cli`)
+- Reads from Anarlog's `app.db` SQLite database at `~/Library/Application Support/hyprnote/app.db` (override with `--db-path`)
 - Index must be built before searching: `meetings index`
 
 ## When to Use
@@ -68,7 +69,7 @@ Returns JSON array of `{rank, score, session_id, title, chunk_type, text, start_
 
 - Always use `--json` for parseable output
 - Title matching is case-insensitive substring — `meetings show "senior helpers"` works
-- Run `meetings index` once before first search, and again after new sessions are added
+- Run `meetings index` once before first search, and again after new sessions are added (sessions now load from `app.db`, so no need to wait for flat files)
 - The search uses local ONNX embeddings (bge-small-en-v1.5) — no API calls needed
 - Combine search results with `meetings show` to get full context around hits
 - For "find action items from X meeting" → search with relevant terms, then show the memo for structured notes
