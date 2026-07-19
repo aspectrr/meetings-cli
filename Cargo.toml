@@ -14,3 +14,5 @@ dirs = "6"
 bincode = "1"
 rayon = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rmcp = { version = "2", features = ["server", "macros", "transport-io", "schemars"] }
+tokio = { version = "1", features = ["full"] }

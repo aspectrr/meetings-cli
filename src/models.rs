@@ -7,9 +7,37 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub created_at: String,
+    pub updated_at: String,
     pub id: String,
     pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub series_id: String,
     pub participants: Vec<Participant>,
+}
+
+/// A note or summary document from `session_documents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub markdown: String,
+    pub sort_order: i64,
+}
+
+/// An action item extracted from a meeting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionItem {
+    pub id: String,
+    pub text: String,
+    pub status: String,
+    pub assignee_human_id: String,
+    pub due_at: String,
+    pub completed_at: Option<String>,
+    pub source_order: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,9 +66,7 @@ pub struct Transcript {
     pub speaker_hints: Vec<serde_json::Value>,
     #[serde(default)]
     pub started_at: i64,
-    /// Memo text extracted from ProseMirror JSON (per transcript row).
-    #[serde(default, skip)]
-    pub memo: String,
+    // ponytail: memo column dropped — notes now read from session_documents
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +85,9 @@ pub struct Session {
     pub id: String,
     pub path: PathBuf,
     pub meta: Meta,
-    pub memo: String,
+    pub note: String,
+    pub summaries: Vec<Document>,
+    pub action_items: Vec<ActionItem>,
     pub transcript: Option<TranscriptFile>,
 }
 
@@ -77,7 +105,8 @@ pub struct Chunk {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChunkType {
-    Memo,
+    Note,
+    Summary,
     TranscriptSegment,
 }
 
@@ -147,17 +176,32 @@ impl Session {
     pub fn chunks(&self, segment_duration_ms: i64) -> Vec<Chunk> {
         let mut chunks = vec![];
 
-        // Memo as one chunk
-        if !self.memo.is_empty() {
+        // Note as one chunk
+        if !self.note.is_empty() {
             chunks.push(Chunk {
                 session_id: self.id.clone(),
                 title: self.meta.title.clone(),
-                chunk_type: ChunkType::Memo,
-                text: self.memo.clone(),
+                chunk_type: ChunkType::Note,
+                text: self.note.clone(),
                 start_ms: None,
                 end_ms: None,
                 channel: None,
             });
+        }
+
+        // Summaries as chunks
+        for s in &self.summaries {
+            if !s.markdown.is_empty() {
+                chunks.push(Chunk {
+                    session_id: self.id.clone(),
+                    title: self.meta.title.clone(),
+                    chunk_type: ChunkType::Summary,
+                    text: s.markdown.clone(),
+                    start_ms: None,
+                    end_ms: None,
+                    channel: None,
+                });
+            }
         }
 
         // Transcript split into segments by time
@@ -245,10 +289,10 @@ pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> 
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
 
-    // All transcripts, grouped by session_id.
+    // Transcripts (words + speaker hints), grouped by session_id.
     let mut transcripts_by_session: HashMap<String, Vec<Transcript>> = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT session_id, id, started_at_ms, words_json, speaker_hints_json, memo
+        "SELECT session_id, id, started_at_ms, words_json, speaker_hints_json
          FROM transcripts
          WHERE deleted_at IS NULL",
     )?;
@@ -259,22 +303,71 @@ pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> 
         let started_at: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
         let words_json: String = row.get(3)?;
         let speaker_json: String = row.get(4)?;
-        let memo_json: String = row.get(5)?;
 
         let words: Vec<Word> = serde_json::from_str(&words_json).unwrap_or_default();
         let speaker_hints: Vec<serde_json::Value> =
             serde_json::from_str(&speaker_json).unwrap_or_default();
-        // Remember which transcript row carried the memo, keyed by transcript id.
-        let memo_text = prosemirror_to_text(&memo_json);
 
-        // ponytail: stash memo text on the first word's id-free path via a side map.
         transcripts_by_session.entry(session_id).or_default().push(Transcript {
             id,
             session_id: String::new(),
             words,
             speaker_hints,
             started_at,
-            memo: memo_text,
+        });
+    }
+    drop(rows);
+    drop(stmt);
+
+    // Notes + summaries from session_documents, grouped by session_id.
+    let mut docs_by_session: HashMap<String, (Option<Document>, Vec<Document>)> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, kind, title, body, body_format, sort_order
+         FROM session_documents
+         WHERE deleted_at IS NULL
+         ORDER BY sort_order",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let title: String = row.get(3)?;
+        let body: String = row.get(4)?;
+        let body_format: String = row.get(5)?;
+        let sort_order: i64 = row.get(6)?;
+
+        let markdown = body_to_text(&body, &body_format);
+        let doc = Document { id, kind: kind.clone(), title, markdown, sort_order };
+        let entry = docs_by_session.entry(session_id).or_default();
+        if kind == "note" {
+            entry.0 = Some(doc);
+        } else {
+            entry.1.push(doc);
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    // Action items, grouped by session_id.
+    let mut actions_by_session: HashMap<String, Vec<ActionItem>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, text, status, assignee_human_id, due_at, completed_at, source_order
+         FROM action_items
+         WHERE deleted_at IS NULL
+         ORDER BY source_order",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(1)?;
+        actions_by_session.entry(session_id).or_default().push(ActionItem {
+            id: row.get(0)?,
+            text: row.get(2)?,
+            status: row.get(3)?,
+            assignee_human_id: row.get(4)?,
+            due_at: row.get(5)?,
+            completed_at: row.get::<_, Option<String>>(6)?,
+            source_order: row.get(7)?,
         });
     }
     drop(rows);
@@ -303,7 +396,8 @@ pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> 
 
     // Sessions, newest first.
     let mut stmt = conn.prepare(
-        "SELECT id, title, created_at FROM sessions WHERE deleted_at IS NULL",
+        "SELECT id, title, created_at, updated_at, kind, status, started_at, ended_at, series_id
+         FROM sessions WHERE deleted_at IS NULL",
     )?;
     let mut rows = stmt.query([])?;
     let mut sessions = Vec::new();
@@ -311,17 +405,19 @@ pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> 
         let id: String = row.get(0)?;
         let title: String = row.get(1)?;
         let created_at: String = row.get(2)?;
+        let updated_at: String = row.get(3)?;
+        let kind: String = row.get(4)?;
+        let status: String = row.get(5)?;
+        let started_at: String = row.get(6)?;
+        let ended_at: String = row.get(7)?;
+        let series_id: String = row.get(8)?;
 
         let mut session_transcripts = transcripts_by_session.remove(&id).unwrap_or_default();
         session_transcripts.sort_by_key(|t| t.started_at);
         let participants = parts_by_session.remove(&id).unwrap_or_default();
-        // Merge any memo text across transcript rows into the session memo.
-        let memo = session_transcripts
-            .iter()
-            .map(|t| t.memo.as_str())
-            .filter(|m| !m.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let (note_doc, summaries) = docs_by_session.remove(&id).unwrap_or((None, vec![]));
+        let action_items = actions_by_session.remove(&id).unwrap_or_default();
+        let note = note_doc.map(|d| d.markdown).unwrap_or_default();
         let transcript = if session_transcripts.is_empty() {
             None
         } else {
@@ -335,17 +431,33 @@ pub fn load_sessions(db_path: &std::path::Path) -> anyhow::Result<Vec<Session>> 
             path: PathBuf::new(),
             meta: Meta {
                 created_at,
+                updated_at,
                 id,
                 title,
+                kind,
+                status,
+                started_at,
+                ended_at,
+                series_id,
                 participants,
             },
-            memo,
+            note,
+            summaries,
+            action_items,
             transcript,
         });
     }
 
     sessions.sort_by(|a, b| b.meta.created_at.cmp(&a.meta.created_at));
     Ok(sessions)
+}
+
+/// Convert a document body to text based on its stored format.
+fn body_to_text(body: &str, format: &str) -> String {
+    match format {
+        "prosemirror_json" => prosemirror_to_text(body),
+        _ => body.trim().to_string(),
+    }
 }
 
 /// Convert a ProseMirror JSON document to plain text.
