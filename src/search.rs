@@ -16,7 +16,7 @@ pub struct SearchResult {
 pub fn run_search(query: &str, top_k: usize, json_output: bool) -> Result<()> {
     let store = Store::load()?;
 
-    println!("Loading embedding model...");
+    eprintln!("Loading embedding model...");
     let mut model = fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
         fastembed::EmbeddingModel::BGESmallENV15,
     ))?;
@@ -37,7 +37,8 @@ pub fn run_search(query: &str, top_k: usize, json_output: bool) -> Result<()> {
                 session_id: chunk.session_id.clone(),
                 title: chunk.title.clone(),
                 chunk_type: match chunk.chunk_type {
-                    crate::models::ChunkType::Memo => "memo".to_string(),
+                    crate::models::ChunkType::Note => "note".to_string(),
+                    crate::models::ChunkType::Summary => "summary".to_string(),
                     crate::models::ChunkType::TranscriptSegment => "transcript".to_string(),
                 },
                 text: chunk.text.clone(),
