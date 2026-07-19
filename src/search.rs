@@ -13,20 +13,21 @@ pub struct SearchResult {
     pub end_ms: Option<i64>,
 }
 
-pub fn run_search(query: &str, top_k: usize, json_output: bool) -> Result<()> {
+/// Core search logic — no printing. Returns ranked results.
+/// Used by both the CLI and MCP server.
+pub fn perform_search(query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
     let store = Store::load()?;
 
-    eprintln!("Loading embedding model...");
-    let mut model = fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
-        fastembed::EmbeddingModel::BGESmallENV15,
-    ))?;
+    let mut model = fastembed::TextEmbedding::try_new(
+        fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15),
+    )?;
 
     let query_vecs = model.embed(vec![query.to_string()], None)?;
     let query_emb = &query_vecs[0];
 
     let hits = store.search(query_emb, top_k);
 
-    let results: Vec<SearchResult> = hits
+    Ok(hits
         .iter()
         .enumerate()
         .map(|(rank, (idx, score))| {
@@ -46,7 +47,12 @@ pub fn run_search(query: &str, top_k: usize, json_output: bool) -> Result<()> {
                 end_ms: chunk.end_ms,
             }
         })
-        .collect();
+        .collect())
+}
+
+/// CLI wrapper — prints results.
+pub fn run_search(query: &str, top_k: usize, json_output: bool) -> Result<()> {
+    let results = perform_search(query, top_k)?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&results)?);

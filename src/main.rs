@@ -42,6 +42,8 @@ enum Commands {
     },
     /// Check database connection and schema
     Doctor,
+    /// Run the read-only MCP server over stdio
+    Mcp,
     /// Index sessions for semantic search
     Index {
         /// Segment duration in milliseconds for transcript chunking
@@ -210,6 +212,9 @@ fn main() -> Result<()> {
         }
         Commands::Doctor => {
             run_doctor(&db_path)?;
+        }
+        Commands::Mcp => {
+            mcp::serve(db_path)?;
         }
         Commands::Index { segment_ms } => {
             index::run_index(&db_path, segment_ms)?;
