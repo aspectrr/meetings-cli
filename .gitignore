@@ -5,3 +5,7 @@
 
 /target
 .fastembed_cache
+
+# Pix Agent
+.pi/
+.pi-lens/
